@@ -9,6 +9,9 @@
 #include <cctype>
 #include <string>
 #include <vector>
+#ifdef GGML_USE_NUMA_MIGRATE
+#include <numa.h>
+#endif
 
 #ifdef GGML_USE_CPU_HBM
 #    include "hbm.h"
@@ -101,6 +104,9 @@ struct ggml_backend_cpu_context {
     ggml_threadpool_t   threadpool;
 
     uint8_t *           work_data;
+#ifdef GGML_USE_NUMA_MIGRATE
+    uint8_t *           work_data_numa[GGML_NUMA_MIGRATE_NODES];
+#endif
     size_t              work_size;
 
     ggml_abort_callback abort_callback;
@@ -118,6 +124,13 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
     delete[] cpu_ctx->work_data;
+#ifdef GGML_USE_NUMA_MIGRATE
+    for (int i = 0; i < GGML_NUMA_MIGRATE_NODES; i++) {
+        if (cpu_ctx->work_data_numa[i] != NULL) {
+            numa_free(cpu_ctx->work_data_numa[i], cpu_ctx->work_size);
+        }
+    }
+#endif
     delete cpu_ctx;
     delete backend;
 }
@@ -141,6 +154,21 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
             delete cpu_plan;
             return NULL;
         }
+#ifdef GGML_USE_NUMA_MIGRATE
+        ggml_backend_init_node_id();
+        for (int i = 0; i < GGML_NUMA_MIGRATE_NODES; i++) {
+            cpu_plan->cplan.work_data_numa[i] = (uint8_t *) numa_alloc_onnode(
+                cpu_plan->cplan.work_size, ggml_backend_get_node_id(i));
+            if (cpu_plan->cplan.work_data_numa[i] == NULL) {
+                for (int j = 0; j < i; j++) {
+                    numa_free(cpu_plan->cplan.work_data_numa[j], cpu_plan->cplan.work_size);
+                }
+                delete[] cpu_plan->cplan.work_data;
+                delete cpu_plan;
+                return NULL;
+            }
+        }
+#endif
     }
 
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
@@ -154,6 +182,13 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
 
     delete[] cpu_plan->cplan.work_data;
+#ifdef GGML_USE_NUMA_MIGRATE
+    for (int i = 0; i < GGML_NUMA_MIGRATE_NODES; i++) {
+        if (cpu_plan->cplan.work_data_numa[i] != NULL) {
+            numa_free(cpu_plan->cplan.work_data_numa[i], cpu_plan->cplan.work_size);
+        }
+    }
+#endif
     delete cpu_plan;
 
     GGML_UNUSED(backend);
@@ -174,14 +209,46 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
 
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
+        cpu_ctx->work_data = NULL;
+#ifdef GGML_USE_NUMA_MIGRATE
+        for (int i = 0; i < GGML_NUMA_MIGRATE_NODES; i++) {
+            if (cpu_ctx->work_data_numa[i] != NULL) {
+                numa_free(cpu_ctx->work_data_numa[i], cpu_ctx->work_size);
+                cpu_ctx->work_data_numa[i] = NULL;
+            }
+        }
+#endif
+
         cpu_ctx->work_data = new uint8_t[cplan.work_size];
         if (cpu_ctx->work_data == NULL) {
             cpu_ctx->work_size = 0;
             return GGML_STATUS_ALLOC_FAILED;
         }
+
+#ifdef GGML_USE_NUMA_MIGRATE
+        ggml_backend_init_node_id();
+        for (int i = 0; i < GGML_NUMA_MIGRATE_NODES; i++) {
+            cpu_ctx->work_data_numa[i] = (uint8_t *) numa_alloc_onnode(cplan.work_size, ggml_backend_get_node_id(i));
+            if (cpu_ctx->work_data_numa[i] == NULL) {
+                for (int j = 0; j < i; j++) {
+                    numa_free(cpu_ctx->work_data_numa[j], cplan.work_size);
+                    cpu_ctx->work_data_numa[j] = NULL;
+                }
+                delete[] cpu_ctx->work_data;
+                cpu_ctx->work_data = NULL;
+                cpu_ctx->work_size = 0;
+                return GGML_STATUS_ALLOC_FAILED;
+            }
+        }
+#endif
         cpu_ctx->work_size = cplan.work_size;
     }
     cplan.work_data = (uint8_t *)cpu_ctx->work_data;
+#ifdef GGML_USE_NUMA_MIGRATE
+    for (int i = 0; i < GGML_NUMA_MIGRATE_NODES; i++) {
+        cplan.work_data_numa[i] = (uint8_t *)(cpu_ctx->work_data_numa[i]);
+    }
+#endif
 
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
@@ -226,6 +293,11 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->n_threads           = GGML_DEFAULT_N_THREADS;
     ctx->threadpool          = NULL;
     ctx->work_data           = NULL;
+#ifdef GGML_USE_NUMA_MIGRATE
+    for (int i = 0; i < GGML_NUMA_MIGRATE_NODES; i++) {
+        ctx->work_data_numa[i]    = NULL;
+    }
+#endif
     ctx->work_size           = 0;
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;

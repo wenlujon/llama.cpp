@@ -15,6 +15,9 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#ifdef GGML_USE_NUMA_MIGRATE
+#include <numa.h>
+#endif
 
 #include "repack.h"
 
@@ -4229,13 +4232,21 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int64_t i2 = i12;
 
         const char * src0_ptr = (const char *) src0->data + i02 * nb02;
-        const char * src1_ptr = (const char *) params->wdata + (i11 + i12 * ne11) * src1_col_stride;
+#ifdef GGML_USE_NUMA_MIGRATE
+        const bool numa_migrate = ggml_numa_migrate_active();
+        const int node_id = numa_migrate ? ggml_get_node_from_cpu(params->ith) : 0;
+        const char * wdata = numa_migrate ? static_cast<const char *>(params->wdata_numa[node_id]) :
+                                            static_cast<const char *>(params->wdata);
+#else
+        const char * wdata = static_cast<const char *>(params->wdata);
+#endif
+        const char * src1_ptr = wdata + (i11 + i12 * ne11) * src1_col_stride;
         char *       dst_ptr  = ((char *) dst->data + (i1 * nb1 + i2 * nb2));
 
         const int64_t nrows = src1_end - src1_start;
         const int64_t ncols = src0_end - src0_start;
 
-        GGML_ASSERT(src1_ptr + src1_col_stride * nrows <= (const char *) params->wdata + params->wsize);
+        GGML_ASSERT(src1_ptr + src1_col_stride * nrows <= wdata + params->wsize);
 
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
         if (nrows > 3) {
@@ -4281,14 +4292,29 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         GGML_ASSERT(ggml_n_dims(op->src[0]) == 2);
         // GGML_ASSERT(ggml_n_dims(op->src[1]) == 2);
-
-        char *       wdata = static_cast<char *>(params->wdata);
+#ifdef GGML_USE_NUMA_MIGRATE
+        const bool numa_migrate = ggml_numa_migrate_active();
+        const int node_id = numa_migrate ? ggml_get_node_from_cpu(ith) : 0;
+        char * wdata = numa_migrate ? static_cast<char *>(params->wdata_numa[node_id]) :
+                                      static_cast<char *>(params->wdata);
+#else
+        char * wdata = static_cast<char *>(params->wdata);
+#endif
         const size_t nbw1  = ggml_row_size(PARAM_TYPE, ne10);
         const size_t nbw2  = nbw1 * ne11;
 
         assert(params->wsize >= nbw2 * ne12);
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
+
+#ifdef GGML_USE_NUMA_MIGRATE
+        const int quant_threads = numa_migrate ? ggml_cores_per_numa(ith) : nth;
+        const int quant_ith = numa_migrate ? ggml_get_start_id_in_node(ith) : ith;
+#else
+        const int quant_threads = nth;
+        const int quant_ith = ith;
+#endif
+        GGML_ASSERT(quant_threads > 0);
 
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
@@ -4297,13 +4323,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             char * data_ptr  = (char *) src1->data + i12 * nb12;
             char * wdata_ptr = wdata + i12 * nbw2;
 
-            for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
+            for (int64_t i11 = quant_ith * 4; i11 < ne11 - ne11 % 4; i11 += quant_threads * 4) {
                 ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
                                                             (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
             }
 
             const int64_t i11_processed = ne11 - ne11 % 4;
-            for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
+            for (int64_t i11 = i11_processed + quant_ith; i11 < ne11; i11 += quant_threads) {
                 from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
             }
         }
@@ -4349,7 +4375,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             ggml_threadpool_chunk_set(params->threadpool, nth);
         }
 
+#ifdef GGML_USE_NUMA_MIGRATE
+        ggml_barrier_numa_aware(params->threadpool, ith, GGML_BARRIER_NODE_LAST);
+#else
         ggml_barrier(params->threadpool);
+#endif
 
         // The first chunk comes from our thread_id, the rest will get auto-assigned.
         int current_chunk = ith;
@@ -4764,7 +4794,11 @@ static ggml_backend_buffer_t ggml_backend_cpu_repack_buffer_type_alloc_buffer(gg
 }
 
 static size_t ggml_backend_cpu_repack_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+#ifdef GGML_USE_NUMA_MIGRATE
+    return ggml_backend_get_page_size();
+#else
     return TENSOR_ALIGNMENT;
+#endif
 
     GGML_UNUSED(buft);
 }

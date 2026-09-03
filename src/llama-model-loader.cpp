@@ -824,6 +824,10 @@ llama_model_loader::llama_model_loader(
         this->use_mmap = false;
     }
 
+#ifdef GGML_USE_NUMA_MIGRATE
+    this->use_mmap = false;
+#endif
+
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
     this->load_mtp = load_mtp;
