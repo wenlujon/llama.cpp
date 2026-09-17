@@ -1937,16 +1937,6 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-#ifdef GGML_USE_NUMA_MIGRATE
-        if (numa_migrate && (cur_a < (n_as / 2)) && (ith >= nth / 2)) {
-            continue;
-        }
-
-        if (numa_migrate && (cur_a >= (n_as / 2)) && (ith < nth / 2)) {
-            continue;
-        }
-#endif
-
         if (iqp && ggml_cpu_iqp_mul_mat_id_min_batch(cne1)) {
             ggml_compute_forward_mul_mat_id_iqp(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0),
                                                 iqp_panels);
@@ -1962,6 +1952,15 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t nr0 = ne01;
         const int64_t nr1 = cne1;
 
+#ifdef GGML_USE_NUMA_MIGRATE
+        const int64_t node_ir0_start = numa_migrate ? nr0 * node_id / GGML_NUMA_MIGRATE_NODES : 0;
+        const int64_t node_ir0_end = numa_migrate ? nr0 * (node_id + 1) / GGML_NUMA_MIGRATE_NODES : nr0;
+#else
+        const int64_t node_ir0_start = 0;
+        const int64_t node_ir0_end = nr0;
+#endif
+        const int64_t node_nr0 = node_ir0_end - node_ir0_start;
+
         int chunk_size = 16;
         if (nr0 == 1 || nr1 == 1) {
             chunk_size = 64;
@@ -1971,19 +1970,19 @@ static void ggml_compute_forward_mul_mat_id(
         const bool disable_chunking = ggml_is_numa();
 
 #ifdef GGML_USE_NUMA_MIGRATE
-        int nth_copy = numa_migrate ? nth / 2 : nth;
+        int nth_copy = numa_migrate ? round_cnts : nth;
 #else
         int nth_copy = nth;
 #endif
-        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+        int64_t nchunk0 = (node_nr0 + chunk_size - 1) / chunk_size;
         int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
         if (nchunk0 * nchunk1 < nth * 4 || disable_chunking) {
-            nchunk0 = nr0 > nr1 ? nth_copy : 1;
-            nchunk1 = nr0 > nr1 ? 1 : nth;
+            nchunk0 = node_nr0 > nr1 ? nth_copy : 1;
+            nchunk1 = node_nr0 > nr1 ? 1 : nth_copy;
         }
 
-        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+        const int64_t dr0 = (node_nr0 + nchunk0 - 1) / nchunk0;
         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
         int current_chunk = start_id;
@@ -1994,8 +1993,8 @@ static void ggml_compute_forward_mul_mat_id(
             const int64_t ith0 = current_chunk % nchunk0;
             const int64_t ith1 = current_chunk / nchunk0;
 
-            const int64_t ir0_start = dr0 * ith0;
-            const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+            const int64_t ir0_start = node_ir0_start + dr0 * ith0;
+            const int64_t ir0_end = MIN(ir0_start + dr0, node_ir0_end);
 
             const int64_t ir1_start = dr1 * ith1;
             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);

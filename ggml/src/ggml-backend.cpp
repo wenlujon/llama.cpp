@@ -2386,8 +2386,58 @@ static int migrate_pages_multiple_nodes(void *addr, size_t total_size) {
     return 0;
 }
 
-static void migrate_pages_with_cache(void *addr, size_t size,
+static bool is_expert_weight_tensor(const struct ggml_tensor * tensor) {
+    return tensor->ne[2] > 1 &&
+        (strstr(tensor->name, ".ffn_down_exps") ||
+         strstr(tensor->name, ".ffn_gate_exps") ||
+         strstr(tensor->name, ".ffn_up_exps") ||
+         strstr(tensor->name, ".ffn_gate_up_exps") ||
+         strstr(tensor->name, ".ffn_down_chexps") ||
+         strstr(tensor->name, ".ffn_gate_chexps") ||
+         strstr(tensor->name, ".ffn_up_chexps"));
+}
+
+static int migrate_expert_rows(const struct ggml_tensor * tensor, size_t total_size) {
+    if (total_size % ggml_backend_page_size != 0 || tensor->nb[2] == 0) {
+        return -1;
+    }
+
+    const size_t num_pages = total_size / ggml_backend_page_size;
+    int * status = (int *) calloc(num_pages, sizeof(int));
+    int * nodes = (int *) malloc(num_pages * sizeof(int));
+    void ** pages = (void **) malloc(num_pages * sizeof(void *));
+
+    if (!status || !nodes || !pages) {
+        free(status);
+        free(nodes);
+        free(pages);
+        return -1;
+    }
+
+    for (size_t page = 0; page < num_pages; ++page) {
+        const size_t offset = page * ggml_backend_page_size;
+        const size_t expert_offset = offset % tensor->nb[2];
+        int node = expert_offset * GGML_NUMA_MIGRATE_NODES / tensor->nb[2];
+        node = MIN(node, GGML_NUMA_MIGRATE_NODES - 1);
+
+        nodes[page] = ggml_backend_node_id[node];
+        pages[page] = (char *) tensor->data + offset;
+    }
+
+    const int ret = move_pages(0, num_pages, pages, nodes, status, MPOL_MF_MOVE);
+    if (ret < 0) {
+        GGML_LOG_ERROR("move_pages failed for expert tensor %s\n", tensor->name);
+    }
+
+    free(status);
+    free(nodes);
+    free(pages);
+    return ret < 0 ? -1 : 0;
+}
+
+static void migrate_pages_with_cache(struct ggml_tensor * tensor, size_t size,
                                      bool force_memset) {
+    void * addr = tensor->data;
     if (size >= GGML_NUMA_MIGRATE_NODES * ggml_backend_page_size) {
         numa_migrate_mapping_cache current_addr(addr, size);
         std::lock_guard<std::mutex> lock(ggml_mapping_mutex);
@@ -2401,7 +2451,11 @@ static void migrate_pages_with_cache(void *addr, size_t size,
                 if (force_memset) {
                     memset(addr, 0, size); // force to allocate memory
                 }
-                if (migrate_pages_multiple_nodes(addr, size) != 0) {
+                const int migrate_result = is_expert_weight_tensor(tensor)
+                    ? migrate_expert_rows(tensor, size)
+                    : migrate_pages_multiple_nodes(addr, size);
+                if (migrate_result != 0) {
+
                     GGML_LOG_DEBUG("Migration to multiple nodes failed, addr: "
                                    "%p, size: %ld\n",
                                    addr, size);
@@ -2432,7 +2486,7 @@ enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct 
 
 #ifdef GGML_USE_NUMA_MIGRATE
     size_t size = ggml_backend_buffer_get_alloc_size(buffer, tensor);
-    migrate_pages_with_cache(tensor->data, size, true);
+    migrate_pages_with_cache(tensor, size, true);
 #endif
     return ggml_backend_buffer_init_tensor(buffer, tensor);
 }
